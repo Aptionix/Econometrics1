@@ -1,1 +1,8 @@
-/.DS_Store
+.DS_Store
+
+# R session state and generated replication outputs
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+/output/r/
