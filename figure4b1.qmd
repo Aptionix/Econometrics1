@@ -1,0 +1,308 @@
+---
+title: "Figure 4(b.1): Stata to R"
+subtitle: "Bindler and Hjalmarsson (2021), *The Impact of the First Professional Police Forces on Crime*, JEEA 19(6)"
+format:
+  html:
+    embed-resources: true
+    toc: true
+execute:
+  message: false
+  warning: false
+---
+
+This document translates the Stata code behind Figure 4, panel (b.1)
+"Robbery, Treated", into R. Each R chunk starts with the original Stata lines
+as comments, labelled with their line numbers in
+`ab_rh_police_and_crime_jeea_data/ab_rh_police_and_crime_jeea.do`. The figure
+comes from the `figure4` block (lines 334-524); the DD estimate printed on the
+figure comes from the `table3` block (lines 717-773). Lines that only build the
+other outcomes (burglary, homicide) or the uncertain-area panel (b.2) are left
+out.
+
+Render from the project folder with `quarto render figure4b1.qmd`.
+
+```{r}
+#| label: packages
+library(haven)     # read Stata .dta files
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(sandwich)  # robust covariance, as in Stata's `, r` option
+```
+
+## 1. Load the data and define the areas
+
+`gen x = (condition)` creates a 0/1 indicator. `replace ... if` overwrites
+values row by row, so later lines win: an uncertain observation first gets
+area 2, then area 3.
+
+```{r}
+#| label: load
+# Stata (l. 338-348):
+#   use ab_rh_police_and_crime_jeea_london_main1.dta, clear
+#   gen treat = (dist_mls<=4 & city==0)
+#   gen uncertain = (dist_mls<=7 & city==0 & treat==0)
+#   gen area = .
+#     replace area = 1 if city==1
+#     replace area = 2 if treat==0 & city==0
+#     replace area = 3 if uncertain==1
+#     replace area = 4 if treat==1
+#     label define area 1 "city" 2 "control" 3 "uncertain" 4 "treatment" 5 "overall"
+#     label values area area
+trials <- read_dta(
+  "ab_rh_police_and_crime_jeea_data/ab_rh_police_and_crime_jeea_london_main1.dta"
+) |>
+  mutate(
+    treat     = as.integer(dist_mls <= 4 & city == 0),
+    uncertain = as.integer(dist_mls <= 7 & city == 0 & treat == 0),
+    area = case_when(
+      city == 1      ~ 1L,  # city: City of London
+      treat == 1     ~ 4L,  # treatment: within 4 miles of Charing Cross
+      uncertain == 1 ~ 3L,  # uncertain: 4-7 miles
+      TRUE           ~ 2L   # control: beyond 7 miles
+    )
+  )
+```
+
+## 2. Build the monthly panel
+
+Each row of the data is one trial. `gen crimes = 1` followed by
+`collapse (sum) crimes, by(...)` counts trials per group, like `count()`.
+`treat` and `uncertain` are fixed by `area`, so grouping by `area` is enough.
+`fillin` adds every missing combination of the listed variables, and the next
+line sets the count to 0 there, like `complete()`. `reshape wide` then puts
+each offence in its own column; panel (b.1) only needs robbery, so the robbery
+rows are kept instead.
+
+```{r}
+#| label: panel
+# Stata (l. 350-371):
+#   gen crimes = 1
+#   collapse (sum) crimes, by(year month area treat uncertain offsubcat_comb)
+#   fillin year month area offsubcat_comb
+#   replace crimes=0 if _fillin==1 & crimes==.
+#   drop _fillin
+#   replace treat=1 if area==4 & treat==.
+#   replace treat=0 if area!=4 & treat==.
+#   replace uncertain=1 if area==3 & uncertain==.
+#   replace uncertain=0 if area!=3 & uncertain==.
+#   reshape wide crimes, i(year month area treat uncertain) j(offsubcat_comb) string
+#   rename crimesrobbery_combined robbery
+panel <- trials |>
+  count(year, month, area, offsubcat_comb, name = "crimes") |>
+  complete(year, month, area, offsubcat_comb, fill = list(crimes = 0L)) |>
+  filter(offsubcat_comb == "robbery_combined") |>
+  transmute(year, month, area,
+            treat     = as.integer(area == 4),
+            uncertain = as.integer(area == 3),
+            robbery   = crimes)
+
+stopifnot(nrow(panel) == 17 * 12 * 4)  # 1821-1837 x 12 months x 4 areas
+```
+
+## 3. Post-reform indicator and event-year bins
+
+`ym(year, month)` and `tm(1821m1)` are Stata monthly dates. Each `event` bin
+is a September-August year, because the Met started in September 1829. Bin 9
+(September 1828 to August 1829) is the last pre-reform year and becomes the
+omitted category. The 17 `replace` lines reduce to one formula.
+
+```{r}
+#| label: event
+# Stata (l. 383-411):
+#   gen post1829 = 0
+#   replace post1829 = 1 if year>=1830
+#   replace post1829 = 1 if year==1829 & month>=9
+#   gen date = ym(year,month)
+#   format date %tm
+#   gen event = .
+#     replace event = 1 if date>=tm(1821m1) & date<=tm(1821m8)
+#     replace event = 2 if date>=tm(1821m9) & date<=tm(1822m8)
+#     ...
+#     replace event = 9 if date>=tm(1828m9) & date<=tm(1829m8)
+#     replace event = 10 if date>=tm(1829m9) & date<=tm(1830m8)
+#     ...
+#     replace event = 16 if date>=tm(1835m9) & date<=tm(1836m8)
+#     replace event = 17 if date>=tm(1836m9)
+panel <- panel |>
+  mutate(
+    post1829 = as.integer(year >= 1830 | (year == 1829 & month >= 9)),
+    # A new bin starts each September; bin 17 runs to the end of the sample.
+    event = as.integer(pmin(year - 1820 + (month >= 9), 17))
+  )
+
+# Check the bins against the Stata date ranges.
+panel |>
+  mutate(ym = sprintf("%d-%02d", year, month)) |>
+  group_by(event) |>
+  summarise(from = min(ym), to = max(ym))
+```
+
+## 4. Event-study regression
+
+`1.event#1.treat` is a dummy equal to 1 when `event == 1` and `treat == 1`.
+Bin 9 is left out, so every coefficient is relative to September 1828 to
+August 1829. `i.year i.month i.area` add year, calendar-month and area fixed
+effects. The `, r` option gives heteroskedasticity-robust (HC1) standard
+errors.
+
+```{r}
+#| label: event-study
+# Stata (l. 414-428), with y = robbery:
+#   foreach y in burglary robbery homicide{
+#   reg `y' 1.event#1.treat 2.event#1.treat 3.event#1.treat 4.event#1.treat ///
+#       5.event#1.treat 6.event#1.treat 7.event#1.treat 8.event#1.treat ///
+#       10.event#1.treat 11.event#1.treat 12.event#1.treat 13.event#1.treat ///
+#       14.event#1.treat 15.event#1.treat 16.event#1.treat 17.event#1.treat ///
+#       1.event#1.uncertain 2.event#1.uncertain ... 8.event#1.uncertain ///
+#       10.event#1.uncertain ... 17.event#1.uncertain ///
+#       i.year i.month i.area, r
+bins <- setdiff(1:17, 9)
+for (b in bins) {
+  panel[[paste0("treat_ev", b)]]     <- panel$treat     * (panel$event == b)
+  panel[[paste0("uncertain_ev", b)]] <- panel$uncertain * (panel$event == b)
+}
+es_terms <- c(paste0("treat_ev", bins), paste0("uncertain_ev", bins))
+
+es_fit <- lm(
+  reformulate(c(es_terms, "factor(year)", "factor(month)", "factor(area)"),
+              response = "robbery"),
+  data = panel
+)
+```
+
+## 5. Coefficients and confidence intervals
+
+`parmest` saves the coefficient table with confidence intervals:
+estimate ± t(0.975, residual df) × robust s.e. The two `keep if` lines drop the
+zero rows Stata reports for base levels, which `lm()` does not report. The
+first 16 remaining rows are the treated interactions. The `t` lines map bin
+`b` to `b - 9`, so the omitted year is 0 and the first post-reform year is 1.
+The `expand` lines add a `t = 0` row of zeros; in the plot it only anchors the
+dashed DD line at 0, which step 7 draws directly. The 90% intervals are never
+plotted, so they are skipped.
+
+```{r}
+#| label: parmest
+# Stata (l. 429-457):
+#   parmest, level(90 95) saving(esd_`y', replace)
+#   use esd_`y', clear
+#   keep parm estimate min95 max95 min90 max90
+#   keep if min95!=0 & max95!=0
+#   keep if min90!=0 & max90!=0
+#   rename estimate coef
+#   gen id = "."
+#   replace id = "treatment" if _n>=1 & _n<=16
+#   replace id = "uncertain" if _n>=17 & _n<=32
+#   drop if id=="."
+#   bys id: gen t = _n
+#   replace t = t-8
+#   replace t = t-1 if t<=0
+#   expand 2 if t==-1, gen(flag)
+#   replace t = 0 if flag==1
+#   replace coef = 0 if flag==1
+#   replace min95 = 0 if flag==1
+#   replace max95 = 0 if flag==1
+#   ...
+#   sort id t
+robust_ci <- function(fit) {
+  b    <- coef(fit)
+  se   <- sqrt(diag(vcovHC(fit, type = "HC1")))
+  crit <- qt(0.975, df.residual(fit))
+  tibble(term = names(b), coef = b, se = se,
+         min95 = b - crit * se, max95 = b + crit * se)
+}
+
+es_coefs <- robust_ci(es_fit) |>
+  filter(term %in% paste0("treat_ev", bins)) |>
+  mutate(t = as.integer(sub("treat_ev", "", term)) - 9L,
+         period = if_else(t < 0, "pre", "post"))
+es_coefs
+```
+
+## 6. DD estimate for the label
+
+The do-file types the DD numbers in by hand: -1.032 with s.e. 0.129. They
+belong to Table 3, panel B, column (1), where the published s.e. is 0.219;
+0.129 is the uncertain-area coefficient in the same column. Here the Table 3
+regression is estimated, and the label uses the computed values.
+
+```{r}
+#| label: dd
+# Stata, table3 block (l. 764-773), with y = robbery:
+#   gen post1829 = 0
+#   replace post1829 = 1 if year>=1830
+#   replace post1829 = 1 if year==1829 & month>=9
+#   reg `y' 1.treat#1.post1829 1.uncertain#1.post1829 ///
+#       i.year i.month i.area, r
+# Hard-coded label values in the figure4 block (l. 466-471):
+#   if temp == "robbery"{
+#     local ddc_t = -1.032
+#     local dds_t = 0.129
+#     ...
+#   }
+dd_fit <- lm(robbery ~ treat:post1829 + uncertain:post1829 +
+               factor(year) + factor(month) + factor(area),
+             data = panel)
+dd <- robust_ci(dd_fit) |> filter(term == "treat:post1829")
+dd
+
+# Table 3, panel B, column (1): -1.032 (0.219)
+stopifnot(abs(dd$coef - (-1.032)) < 5e-4, abs(dd$se - 0.219) < 5e-4)
+```
+
+## 7. Plot
+
+`connected` draws points joined by a line. Pre- and post-reform points are
+separate series, so the line breaks at the omitted year. `msymbol(Oh)` is a
+hollow circle and `msymbol(O)` a filled one. `gs0`, `gs5` and `gs10` are Stata
+grey levels, from black to light grey. `placement(w)` puts the text box to the
+left of the point (-1, 5.5).
+
+```{r}
+#| label: figure4b1
+#| fig-cap: "Figure 4(b.1): Robbery, Treated."
+#| fig-width: 6
+#| fig-height: 5
+# Stata (l. 479-498):
+#   gen ddc = `ddc_t' if id=="treatment"
+#   twoway ///
+#   (connected coef t if t<0 & id=="treatment", msymbol(Oh) mcolor(gs0) msize(large) lw(medthick) lc(gs0)) ///
+#   (connected coef t if t>0 & id=="treatment", msymbol(O) mcolor(gs0)  msize(large) lw(medthick) lc(gs0)) ///
+#   (line min95 t if t<0 & id=="treatment", lcolor(gs0) lw(med) lp(solid)) ///
+#   (line min95 t if t>0 & id=="treatment", lcolor(gs0) lw(med) lp(solid)) ///
+#   (line max95 t if t<0 & id=="treatment", lcolor(gs0) lw(med) lp(solid)) ///
+#   (line max95 t if t>0 & id=="treatment", lcolor(gs0) lw(med) lp(solid)) ///
+#   (line ddc t if t>=0 & id=="treatment", lc(gs10) lp(dash) lw(medthick)), ///
+#   xline(0, lc(gs5) lw(medthick)) ///
+#   yline(0, lc(gs5) lw(medthick)) ///
+#   xlabel(-8(1)8) ///
+#   ylabel(-6(2)6) ///
+#   text(5.5 -1 "DD estimate: `ddc_t'" "(s.e. = `dds_t')", ///
+#   size(medium) placement(w) box fc(white)) ///
+#   ytitle("Coefficient and 95% C.I.") xtitle("Year after reform") ///
+#   graphregion(color(white)) bgcolor(white) legend(off)
+#   graph export "figure4_`y'_1.pdf", replace
+fig4b1 <- ggplot(es_coefs, aes(t, coef, group = period)) +
+  geom_vline(xintercept = 0, colour = "grey31", linewidth = 0.8) +
+  geom_hline(yintercept = 0, colour = "grey31", linewidth = 0.8) +
+  annotate("segment", x = 0, xend = 8, y = dd$coef, yend = dd$coef,
+           colour = "grey63", linetype = "dashed", linewidth = 0.8) +
+  geom_line(aes(y = min95), linewidth = 0.5) +
+  geom_line(aes(y = max95), linewidth = 0.5) +
+  geom_line(linewidth = 0.8) +
+  geom_point(aes(shape = period), size = 3, fill = "white") +
+  scale_shape_manual(values = c(pre = 21, post = 19), guide = "none") +
+  annotate("label", x = -1, y = 5.5, hjust = 1,
+           label = sprintf("DD estimate: %.3f\n(s.e. = %.3f)", dd$coef, dd$se)) +
+  scale_x_continuous(breaks = -8:8) +
+  scale_y_continuous(breaks = seq(-6, 6, 2)) +
+  expand_limits(y = c(-6, 6)) +
+  labs(x = "Year after reform", y = "Coefficient and 95% C.I.") +
+  theme_classic() +
+  theme(panel.grid.major.y = element_line(colour = "grey90"))  # Stata's default y grid
+fig4b1
+
+dir.create("output", showWarnings = FALSE)
+ggsave("output/figure4_robbery_1.pdf", fig4b1, width = 6, height = 5)
+```
